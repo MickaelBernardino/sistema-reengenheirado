@@ -1,0 +1,128 @@
+name: Pipeline de Evolução Segura (CI/CD)
+
+on:
+  push:
+    tags:
+      - 'v[0-9]+.[0-9]+.[0-9]+'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  analise_codigo_e_seguranca:
+    name: SonarQube Cloud e Trivy (dependências)
+    if: ${{ !github.event.deleted }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Obter o código da tag
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Analisar o código e aguardar o Quality Gate
+        uses: SonarSource/sonarqube-scan-action@a31c9398be7ace6bbfaf30c0bd5d415f843d45e9 # v7.0.0
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+        with:
+          args: >
+            -Dsonar.organization=mickaelbernardino
+            -Dsonar.projectKey=MickaelBernardino_sistema-reengenheirado
+            -Dsonar.projectVersion=${{ github.ref_name }}
+            -Dsonar.qualitygate.wait=true
+            -Dsonar.qualitygate.timeout=600
+
+      - name: Trivy - dependências do repositório
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          scan-type: fs
+          scan-ref: .
+          scanners: vuln
+          format: table
+          severity: 'HIGH,CRITICAL'
+          ignore-unfixed: false
+          exit-code: '1'
+
+  build_e_verificacao_da_imagem:
+    name: Build e Trivy (imagem final)
+    needs: analise_codigo_e_seguranca
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    outputs:
+      image_id: ${{ steps.build.outputs.image_id }}
+    steps:
+      - name: Obter o código da tag
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Construir a imagem candidata
+        id: build
+        run: |
+          docker build --pull --tag sistema-financeiro:candidata .
+          image_id="$(docker image inspect --format '{{.Id}}' sistema-financeiro:candidata)"
+          printf 'image_id=%s\n' "$image_id" >> "$GITHUB_OUTPUT"
+
+      - name: Trivy - pacotes do sistema e bibliotecas na imagem
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          scan-type: image
+          image-ref: sistema-financeiro:candidata
+          scanners: vuln
+          vuln-type: 'os,library'
+          format: table
+          severity: 'HIGH,CRITICAL'
+          ignore-unfixed: false
+          exit-code: '1'
+
+      - name: Exportar a imagem aprovada
+        run: docker save --output "$RUNNER_TEMP/sistema-financeiro.tar" sistema-financeiro:candidata
+
+      - name: Guardar imagem para publicação
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: imagem-aprovada
+          path: ${{ runner.temp }}/sistema-financeiro.tar
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 1
+
+  publicar:
+    name: Publicar a imagem no Docker Hub
+    needs: build_e_verificacao_da_imagem
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Recuperar imagem aprovada
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: imagem-aprovada
+          path: ${{ runner.temp }}
+
+      - name: Conferir identidade da imagem
+        env:
+          IMAGE_ID: ${{ needs.build_e_verificacao_da_imagem.outputs.image_id }}
+        run: |
+          docker load --input "$RUNNER_TEMP/sistema-financeiro.tar"
+          loaded_id="$(docker image inspect --format '{{.Id}}' sistema-financeiro:candidata)"
+          test -n "$IMAGE_ID"
+          test "$loaded_id" = "$IMAGE_ID"
+
+      - name: Publicar a imagem da versão
+        env:
+          DOCKER_USERNAME: ${{ secrets.DOCKER_USERNAME }}
+          DOCKER_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          test -n "$DOCKER_USERNAME"
+          test -n "$DOCKER_PASSWORD"
+          image_ref="$DOCKER_USERNAME/sistema-reengenheirado:$RELEASE_TAG"
+          trap 'docker logout >/dev/null 2>&1 || true' EXIT
+          printf '%s\n' "$DOCKER_PASSWORD" | docker login --username "$DOCKER_USERNAME" --password-stdin
+          docker tag sistema-financeiro:candidata "$image_ref"
+          docker push "$image_ref"
