@@ -4,7 +4,7 @@ COPY pom.xml ./
 COPY src ./src
 RUN mvn --batch-mode --no-transfer-progress verify
 
-FROM gcr.io/distroless/java21-debian13:nonroot
+FROM cgr.dev/chainguard/jre:latest
 WORKDIR /app
 COPY --from=build /build/target/sistema-financeiro.jar /app/sistema-financeiro.jar
-ENTRYPOINT ["java", "-jar", "/app/sistema-financeiro.jar"]
+ENTRYPOINT ["/usr/bin/java", "-jar", "/app/sistema-financeiro.jar"]
